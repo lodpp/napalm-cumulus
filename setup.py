@@ -1,20 +1,25 @@
 """setup.py file."""
 import uuid
 
-try:  # for pip >= 10
-    from pip._internal.req import parse_requirements
-except ImportError:  # for pip <= 9.0.3
-    from pip.req import parse_requirements
+#try:  # for pip >= 10
+#    from pip._internal.req import parse_requirements
+#except ImportError:  # for pip <= 9.0.3
+#    from pip.req import parse_requirements
 
 from setuptools import find_packages, setup
 
 __author__ = 'Arthur Halet <arthur.halet@orange.com>'
 
-install_reqs = parse_requirements('requirements.txt', session=uuid.uuid1())
-try:
-    reqs = [str(ir.req) for ir in install_reqs]
-except AttributeError:
-    reqs = [str(ir.requirement) for ir in install_reqs]
+
+# Read the requirements from the file
+with open("requirements.txt", encoding="utf-8") as f:
+    reqs = f.read().splitlines()
+
+#install_reqs = parse_requirements('requirements.txt', session=uuid.uuid1())
+#try:
+#    reqs = [str(ir.req) for ir in install_reqs]
+#except AttributeError:
+#    reqs = [str(ir.requirement) for ir in install_reqs]
 
 setup(
     name="napalm-cumulus",

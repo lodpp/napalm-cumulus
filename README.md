@@ -24,5 +24,3 @@ you can use this new driver, example with napalm command line:
 ```
 napalm --user myuser --vendor cumulus my-mellanox.switch.company.com call get_interfaces
 ```
-
-
