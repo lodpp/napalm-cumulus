@@ -1,11 +1,4 @@
 """setup.py file."""
-import uuid
-
-#try:  # for pip >= 10
-#    from pip._internal.req import parse_requirements
-#except ImportError:  # for pip <= 9.0.3
-#    from pip.req import parse_requirements
-
 from setuptools import find_packages, setup
 
 __author__ = 'Arthur Halet <arthur.halet@orange.com>'
@@ -15,16 +8,17 @@ __author__ = 'Arthur Halet <arthur.halet@orange.com>'
 with open("requirements.txt", encoding="utf-8") as f:
     reqs = f.read().splitlines()
 
-#install_reqs = parse_requirements('requirements.txt', session=uuid.uuid1())
-#try:
-#    reqs = [str(ir.req) for ir in install_reqs]
-#except AttributeError:
-#    reqs = [str(ir.requirement) for ir in install_reqs]
-
 setup(
     name="napalm-cumulus",
     version="0.5.8+lodpp.0.3a2",
     packages=find_packages(),
+    include_package_data=False,
+    package_data={
+        "napalm_cumulus": [
+            "templates/*.j2",
+            "utils/textfsm_templates/*",
+        ],
+    },
     author="Arthur Halet",
     author_email="arthur.halet@orange.com",
     description="Network Automation and Programmability Abstraction Layer with Multivendor support",
@@ -36,6 +30,5 @@ setup(
         'Operating System :: MacOS',
     ],
     url="https://github.com/napalm-automation/napalm-cumulus",
-    include_package_data=True,
     install_requires=reqs,
 )

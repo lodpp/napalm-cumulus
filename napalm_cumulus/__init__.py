@@ -13,12 +13,12 @@
 # the License.
 
 """napalm-cumulus package."""
-import pkg_resources
+from importlib.metadata import PackageNotFoundError, version
 from napalm_cumulus.cumulus import CumulusDriver
 
 try:
-    __version__ = pkg_resources.get_distribution('napalm-cumulus').version
-except pkg_resources.DistributionNotFound:
+    __version__ = version("napalm-cumulus")
+except PackageNotFoundError:
     __version__ = "Not installed"
 
 __all__ = ['CumulusDriver']
