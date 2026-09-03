@@ -23,6 +23,7 @@ from __future__ import unicode_literals
 
 import ipaddress
 import json
+import logging
 import re
 from collections import defaultdict
 from datetime import datetime
@@ -35,7 +36,7 @@ from napalm.base.exceptions import (
 )
 from napalm.base.utils import string_parsers
 from netmiko import ConnectHandler
-from netmiko.ssh_exception import NetMikoTimeoutException
+from netmiko.exceptions import NetMikoTimeoutException
 from pytz import timezone
 
 
@@ -88,6 +89,7 @@ class CumulusDriver(NetworkDriver):
                                          host=self.hostname,
                                          username=self.username,
                                          password=self.password,
+                                         disabled_algorithms={ "pubkeys": ["rsa-sha2-256","rsa-sha2-512"]},
                                          **self.netmiko_optional_args)
             # Enter root mode.
             if self.netmiko_optional_args.get('secret'):
@@ -156,45 +158,78 @@ class CumulusDriver(NetworkDriver):
             self.changed = False
 
     def _send_command(self, command):
+        return self.device.send_command(command)
+
+    def _send_command_timing(self, command):
         return self.device.send_command_timing(command)
 
     def get_facts(self):
         facts = {
             'vendor': 'Nvidia',
         }
+        discovery = dict()
 
         # Get "net show hostname" output.
-        hostname = self.device.send_command('hostname')
-
-        # Get "net show system" output.
-        show_system_output = self._send_command('net show system')
-        for line in show_system_output.splitlines():
-            if 'build' in line.lower():
-                os_version = line.split()[-1]
-                model = ' '.join(line.split()[1:3])
-            elif 'uptime' in line.lower():
-                uptime = line.split()[-1]
-
-        # Get "decode-syseeprom" output.
-        decode_syseeprom_output = self.device.send_command('decode-syseeprom')
-        for line in decode_syseeprom_output.splitlines():
-            if 'serial number' in line.lower():
-                serial_number = line.split()[-1]
-
-        # Get "net show interface all json" output.
-        interfaces = self._send_command('net show interface all json')
-        # Handling bad send_command_timing return output.
-        try:
-            interfaces = json.loads(interfaces)
-        except ValueError:
-            interfaces = json.loads(self.device.send_command('net show interface all json'))
-
+        hostname = self._send_command('hostname')
         facts['hostname'] = facts['fqdn'] = hostname
-        facts['os_version'] = os_version
-        facts['model'] = model
-        facts['uptime'] = string_parsers.convert_uptime_string_seconds(uptime)
-        facts['serial_number'] = serial_number
-        facts['interface_list'] = string_parsers.sorted_nicely(interfaces.keys())
+
+        # Get the cumulus version, should work starting from CL 3.2.0
+        try:
+            version_output = self._send_command('net show version')
+            for line in version_output.splitlines():
+                if 'distrib_release' in line.lower():
+                    facts['os_version'] = line.split("=")[-1]
+        except Exception as e:
+            raise Exception(f"Unable to retrieve the cumulus software version: {e}")  # noqa=E501
+
+        if not re.fullmatch(r"\d+\.\d+\.\d+", facts['os_version']):
+            raise Exception(f"The CL version does not match the Cumulus X.Y.Z scheme: {facts['os_version']}")  # noqa=E501
+
+        major_version, minor_version, maintenance_version = map(int, facts['os_version'].split("."))  # noqa=E501
+
+        # version below 3.5.0 at least does not support some json output
+        legacy_os = False
+        if major_version <= 3 and minor_version <= 5 and maintenance_version <= 0 :  # noqa=E501
+            legacy_os = True
+
+        """
+        On older cl version, the `net show system` command does not implement
+        json output. We need to parse `decode-syseeprom` instead.
+
+        At least on DELL HW, the serial number that matters is the Service Tag
+        when dealing with Dell support. Using it instead of the real SN if
+        available
+        """
+        if legacy_os:
+            decode_syseeprom_output = self._send_command('decode-syseeprom')
+            for line in decode_syseeprom_output.splitlines():
+                if 'product name' in line.lower():
+                    facts['model'] = line.split()[-1]
+                elif 'serial number' in line.lower():
+                    facts['serial_number'] = line.split()[-1]
+                elif 'service tag' in line.lower():
+                    facts['serial_number'] = line.split()[-1]
+
+            show_system_output = self._send_command('net show system')
+            for line in show_system_output.splitlines():
+                if 'uptime' in line.lower():
+                    uptime = line.removeprefix("uptime:").strip()
+                    string_parsers.convert_uptime_string_seconds(uptime)
+        else:
+            show_system_output = self._send_command('net show system json')
+            show_system = json.loads(show_system_output)
+
+            facts['uptime'] = string_parsers.convert_uptime_string_seconds(show_system['uptime'])  # noqa=E501
+            facts['model'] = show_system['eeprom']['tlv']['Product Name']['value']  # noqa=E501
+            facts['serial_number'] = show_system['eeprom']['tlv']['Serial Number']['value']  # noqa=E501
+
+            if show_system['eeprom']['tlv'].get("Service Tag"):
+                facts['serial_number'] = show_system['eeprom']['tlv']['Service Tag']['value']  # noqa=E501
+
+        # Get 'net show interface all json' output.
+        raw_interfaces_output = self.device.send_command('net show interface all json', read_timeout=60)  # noqa=E501
+        interfaces_output = json.loads(raw_interfaces_output)
+        facts['interface_list'] = string_parsers.sorted_nicely(interfaces_output.keys())  # noqa=E501
         return facts
 
     def get_arp_table(self):
@@ -246,8 +281,8 @@ class CumulusDriver(NetworkDriver):
 
         for ntp_info in output:
             if len(ntp_info) > 0:
-                remote, refid, st, t, when, hostpoll, reachability, delay, offset, \
-                jitter = ntp_info.split()
+                remote, refid, st, t, when, hostpoll, reachability, delay, \
+                    offset, jitter = ntp_info.split()
 
                 # 'remote' contains '*' if the machine synchronized with NTP server
                 synchronized = "*" in remote
@@ -403,6 +438,7 @@ class CumulusDriver(NetworkDriver):
 
     def _get_interface_neighbors(self, interface):
         neighbors = []
+
         for idx, chassis in enumerate(interface['chassis']):
             hostname = ''
             if 'name' in chassis.keys():
@@ -414,25 +450,35 @@ class CumulusDriver(NetworkDriver):
 
         return neighbors
 
-    def _get_interface_neighbors_detail(self, interface):
+    def _get_interface_neighbors_legacy(self, interface):
         neighbors = []
-        command = 'net show interface {} json'.format(interface['name'])
-        if_output = {}
-        try:
-            if_output = json.loads(self._send_command(command))
-        except ValueError:
-            if_output = json.loads(self.device.send_command(command))
+
+        for idx, chassis in enumerate(interface):
+            hostname = ''
+            if 'adj_hostname' in chassis.keys():
+                hostname = chassis['adj_hostname']
+
+            neighbors.append({
+                'hostname': hostname,
+                'port': chassis['adj_port'],
+            })
+
+        return neighbors
+
+    def _get_interface_neighbors_detail(self, intf_lldp, intf_show):
+        neighbors = []
+
         parent_interface = ''
-        print(if_output['summary'])
-        find_parent = re.search('Master: ([A-Za-z0-9_-]+)\(\w+\)', if_output['summary'], re.M)
+        logging.debug("Working on interface: %s" % intf_lldp['name'])
+        find_parent = re.search('Master: ([A-Za-z0-9_-]+)\(\w+\)', intf_show['summary'], re.M)  # noqa=E501
         if find_parent:
             parent_interface = find_parent.group(1)
 
-        for idx, chassis in enumerate(interface['chassis']):
+        for idx, chassis in enumerate(intf_lldp['chassis']):
             hostname = ''
             if 'name' in chassis.keys():
                 hostname = chassis['name'][0]['value']
-            port = interface['port'][idx]
+            port = intf_lldp['port'][idx]
             elem = {
                 'parent_interface': parent_interface,
                 'remote_chassis_id': chassis['id'][0]['value'],
@@ -444,14 +490,74 @@ class CumulusDriver(NetworkDriver):
                 'remote_port_description': '',
             }
             if 'capability' in chassis.keys():
-                elem['remote_system_capab'] = [item['type'].lower() for item in chassis['capability']]
-                elem['remote_system_enable_capab'] = [item['type'].lower() for item in chassis['capability'] if
-                                                      item['enabled'] == True]
+                elem['remote_system_capab'] = [item['type'].lower() for item in chassis['capability']]  # noqa=E501
+                elem['remote_system_enable_capab'] = [item['type'].lower() for item in chassis['capability'] if  # noqa=E501
+                                                      item['enabled']]
 
             if 'descr' in chassis.keys():
-                elem['remote_system_description'] = chassis['descr'][0]['value']
+                elem['remote_system_description'] = chassis['descr'][0]['value']  # noqa=E501
             if 'descr' in port.keys():
                 elem['remote_port_description'] = port['descr'][0]['value']
+
+            neighbors.append(elem)
+        return neighbors
+
+    def _get_interface_neighbors_detail_legacy(self,
+                                               interface_name,
+                                               interface_data):
+        """
+        On older cumulus release, the LLDP output from `net show lldp json` is the
+        same than from `net show interface json`.
+        Unlike more recent/current version, there is no point in wasting time
+        querrying netd for each interface.
+
+        Gain is huge on my box with ~50 interfaces with LLDP
+        real    0m37.869s
+        VS
+        real    4m35.909s
+        """
+        neighbors = []
+
+        parent_interface = ''
+        logging.debug("Working on interface: %s" % interface_name)
+        find_parent = re.search('Master: ([A-Za-z0-9_-]+)\(\w+\)', ' '.join(interface_data['summary']), re.M)  # noqa=E501
+        if find_parent:
+            parent_interface = find_parent.group(1)
+
+        for idx, chassis in enumerate(interface_data['iface_obj']['lldp']):
+            hostname = ''
+            if 'adj_hostname' in chassis.keys():
+                hostname = chassis['adj_hostname']
+
+            remote_chassis_id = ''
+            if 'adj_mac' in chassis.keys():
+                remote_chassis_id = chassis['adj_mac']
+
+            elem = {
+                'parent_interface': parent_interface,
+                'remote_chassis_id': remote_chassis_id,
+                'remote_system_name': hostname,
+                'remote_port': chassis['adj_port'],
+                'remote_system_capab': [],
+                'remote_system_enable_capab': [],
+                'remote_system_description': '',
+                'remote_port_description': '',
+            }
+
+            if 'capabilities' in chassis.keys():
+                remote_system_capab = []
+                remote_system_enable_capab = []
+
+                for cap in chassis['capabilities']:
+                    remote_system_capab.append(cap[0])
+                    if cap[1] == 'on':
+                        remote_system_enable_capab.append(cap[0])
+
+                elem['remote_system_capab'] = remote_system_capab
+                elem['remote_system_enable_capab'] = remote_system_enable_capab
+
+            if 'system_descr' in chassis.keys() and chassis['system_descr']:
+                elem['remote_system_description'] = chassis['system_descr']
 
             neighbors.append(elem)
         return neighbors
@@ -464,13 +570,22 @@ class CumulusDriver(NetworkDriver):
         try:
             lldp_output = json.loads(self._send_command(command))
         except ValueError:
-            lldp_output = json.loads(self.device.send_command(command))
+            lldp_output = json.loads(self.device.send_command(command, delay_factor=2))
 
-        for all_lldp in lldp_output['lldp']:
-            if 'interface' not in all_lldp.keys():
-                continue
-            for interface in all_lldp['interface']:
-                lldp[interface['name']] = self._get_interface_neighbors(interface)
+        if 'lldp' in lldp_output.keys():
+            for all_lldp in lldp_output['lldp']:
+                if 'interface' not in all_lldp.keys():
+                    continue
+                for interface in all_lldp['interface']:
+                    lldp[interface['name']] = self._get_interface_neighbors(interface)  # noqa=E501
+        else:
+            """
+            Legacy cumulus fallback (at least for CL3.3.2)
+            """
+            for interface in lldp_output:
+                lldp[interface] = self._get_interface_neighbors_legacy(
+                                    lldp_output[interface]['iface_obj']['lldp'])  # noqa=E501
+
         return lldp
 
     def get_lldp_neighbors_detail(self, interface=""):
@@ -481,29 +596,74 @@ class CumulusDriver(NetworkDriver):
         command = 'net show lldp json'
         if interface:
             command = 'net show lldp {} json'.format(interface)
-        try:
-            lldp_output = json.loads(self._send_command(command))
-        except ValueError:
-            lldp_output = json.loads(self.device.send_command(command))
 
-        for all_lldp in lldp_output['lldp']:
-            if 'interface' not in all_lldp.keys():
-                continue
-            for interface in all_lldp['interface']:
-                lldp[interface['name']] = self._get_interface_neighbors_detail(interface)
+        """
+        Setting read_timeout and delay_factor by default, the
+        `net show lldp json` command takes quite some time to complete.
+        I don't use the send_command_timing as the command is not outputing
+        anything untill it's ready to dump all data gathered.
+        """
+        lldp_output = json.loads(self.device.send_command(command, read_timeout=60, delay_factor=2))
+
+        if 'lldp' in lldp_output.keys():
+            for all_lldp in lldp_output['lldp']:
+                if 'interface' not in all_lldp.keys():
+                    continue
+
+                """
+                To populate the parent_interface (ie LAG), we need to get data
+                from `net show interface`
+                Doing it globally here avoid the call for each interface later
+
+                Gain is huge on my box with ~80 interfaces with LLDP (cl3.7.6)
+                real    6m4.966s
+                VS
+                real    0m22.937s
+                """
+                showintf_command = 'net show interface {} json'.format(interface)  # noqa=E501
+                try:
+                    intfs_output = json.loads(self._send_command(showintf_command))  # noqa=E501
+                except ValueError:
+                    intfs_output = json.loads(self.device.send_command(showintf_command, delay_factor=2))  # noqa=E501
+
+                for interface in all_lldp['interface']:
+                    intf_name = interface['name']
+                    lldp_intf = self._get_interface_neighbors_detail(
+                                                    interface,
+                                                    intfs_output[intf_name])
+
+                    """
+                    In odd cases, like with some broadcom network card which
+                    have an onboard LLDP agent, the Cumulus `net show lldp json`
+                    reports (cl3.5.0/cl3.7.6) multiple entries in the all_lldp
+                    list for the same interface.
+                    Merging this kind of entries to have a single list of
+                    neighbor per interface as expected.
+                    """
+                    if intf_name in lldp.keys():
+                        lldp[intf_name].extend(lldp_intf)
+                    else:
+                        lldp[intf_name] = lldp_intf
+
+
+        else:
+            """
+            Legacy cumulus fallback (at least for CL3.3.2)
+            """
+            for interface_name, interface_data in lldp_output.items():
+                lldp[interface_name] = self._get_interface_neighbors_detail_legacy(  # noqa=E501
+                                                                interface_name,
+                                                                interface_data)
 
         return lldp
 
     def get_interfaces(self):
         interfaces = {}
         # Get 'net show interface all json' output.
-        output = self._send_command('net show interface all json')
-        # Handling bad send_command_timing return output.
-        try:
-            output_json = json.loads(output)
-        except ValueError:
-            output_json = json.loads(self.device.send_command('net show interface all json'))
-        for interface_name, interface_cu in output_json.items():
+        raw_interfaces_output = self.device.send_command('net show interface all json', read_timeout=60)  # noqa=E501
+        interfaces_output = json.loads(raw_interfaces_output)
+
+        for interface_name, interface_cu in interfaces_output.items():
             interface = {}
             if interface_cu['linkstate'] == 'UP':
                 interface['is_enabled'] = True
@@ -512,12 +672,16 @@ class CumulusDriver(NetworkDriver):
                 interface['is_enabled'] = False
                 interface['is_up'] = False
 
-            interface['description'] = interface_cu['summary']
+            interface['description'] = interface_cu['iface_obj']['description']
 
             if interface_cu['speed'] is None or interface_cu['speed'] == 'N/A':
                 interface['speed'] = -1
             elif interface_cu['speed'].endswith('G'):
-                interface['speed'] = int(interface_cu['speed'].rstrip('G')) * 1024
+                interface['speed'] = int(interface_cu['speed'].removesuffix('G')) * 1024
+            elif interface_cu['speed'].endswith('G(QSFP)'):
+                interface['speed'] = int(interface_cu['speed'].removesuffix('G(QSFP)')) * 1024
+            elif interface_cu['speed'].endswith('G(4x10G)'):
+                interface['speed'] = int(interface_cu['speed'].removesuffix('G(4x10G)')) * 1024
             else:
                 interface['speed'] = int(interface_cu['speed'][:-1])
 
@@ -589,24 +753,20 @@ class CumulusDriver(NetworkDriver):
             rstrip('/l3')
 
     def get_interfaces_ip(self):
-        # Get net show interface all json output.
-        output = self._send_command('net show interface all json')
-        # Handling bad send_command_timing return output.
-        try:
-            output_json = json.loads(output)
-        except ValueError:
-            output_json = json.loads(self.device.send_command('net show interface all json'))
+        # Get 'net show interface all json' output.
+        raw_interfaces_output = self.device.send_command('net show interface all json', read_timeout=60)  # noqa=E501
+        interfaces_output = json.loads(raw_interfaces_output)
 
         def rec_dd():
             return defaultdict(rec_dd)
 
         interfaces_ip = rec_dd()
 
-        for interface in output_json:
-            if not output_json[interface]['iface_obj']['ip_address']['allentries']:
+        for interface in interfaces_output:
+            if not interfaces_output[interface]['iface_obj']['ip_address']['allentries']:
                 continue
             else:
-                for ip_address in output_json[interface]['iface_obj']['ip_address']['allentries']:
+                for ip_address in interfaces_output[interface]['iface_obj']['ip_address']['allentries']:
                     ip_ver = ipaddress.ip_interface(ip_address).version
                     ip_ver = 'ipv{}'.format(ip_ver)
                     ip, prefix = ip_address.split('/')
