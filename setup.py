@@ -23,7 +23,7 @@ with open("requirements.txt", encoding="utf-8") as f:
 
 setup(
     name="napalm-cumulus",
-    version="0.5.6",
+    version="0.5.8+lodpp.0.3a2",
     packages=find_packages(),
     author="Arthur Halet",
     author_email="arthur.halet@orange.com",
