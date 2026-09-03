@@ -10,7 +10,7 @@ with open("requirements.txt", encoding="utf-8") as f:
 
 setup(
     name="napalm-cumulus",
-    version="0.5.8+lodpp.0.3a2",
+    version="0.5.8+lodpp.0.3a3",
     packages=find_packages(),
     include_package_data=False,
     package_data={
